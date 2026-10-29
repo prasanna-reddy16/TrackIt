@@ -1,0 +1,23 @@
+server:
+  port: 8080
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/trackit
+    username: trackit
+    password: trackit
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  data:
+    redis:
+      host: localhost
+      port: 6379
+trackit:
+  api-key: dev-key                 # required in X-API-KEY header for POST endpoints
+  geofence-meters: 500
+  simulator:
+    enabled: true
+    vehicles-per-route: 5
+    tick-ms: 2000
+    speed-multiplier: 4            # makes the demo move faster than real life

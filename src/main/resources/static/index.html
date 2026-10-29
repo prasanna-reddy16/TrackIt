@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrackIt - live vehicle tracking</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { height:100%; margin:0; font-family:system-ui, sans-serif; }
+  body { display:grid; grid-template-columns: 320px 1fr; }
+  aside { padding:14px; overflow:auto; border-right:1px solid #ddd; background:#fafafa; }
+  #map { height:100%; }
+  h1 { font-size:1.2rem; margin:0 0 10px; } h3 { margin:14px 0 6px; font-size:.95rem; }
+  select, button, input { font:inherit; padding:6px 8px; margin:2px 0; }
+  .alert { background:#fff3cd; border-left:4px solid #e0a800; padding:6px 8px; margin:6px 0; font-size:.85rem; border-radius:4px; }
+  .veh { font-size:.85rem; padding:4px 0; border-bottom:1px solid #eee; cursor:pointer; }
+  .muted { color:#666; font-size:.8rem; }
+  /* Animated bus marker: inline SVG, so no external image file is needed. */
+  .bus-marker-icon { background: transparent; border: 0; }
+  .bus-marker {
+    position: relative; width: 44px; height: 44px; display: grid; place-items: center;
+    overflow: visible;
+  }
+  .bus-marker::before {
+    content: ""; position: absolute; inset: 3px; border: 2px solid rgba(79,70,229,.32);
+    border-radius: 50%; animation: busHalo 1.8s ease-out infinite;
+  }
+  .bus-marker__svg {
+    position: relative; z-index: 1; width: 42px; height: 42px; overflow: visible;
+    filter: drop-shadow(0 2px 2px rgba(17,24,39,.32));
+    transform-origin: 50% 70%; animation: busBounce 1.15s ease-in-out infinite;
+  }
+  .bus-marker__wheel { transform-box: fill-box; transform-origin: center; animation: wheelSpin 1.1s linear infinite; }
+  @keyframes busBounce { 0%,100% { transform: translateY(0) rotate(-1deg); } 50% { transform: translateY(-2px) rotate(1deg); } }
+  @keyframes busHalo { 0% { transform: scale(.82); opacity:.75; } 100% { transform: scale(1.22); opacity:0; } }
+  @keyframes wheelSpin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .bus-marker::before, .bus-marker__svg, .bus-marker__wheel { animation: none; }
+  }
+  @media (max-width:700px){ body{ grid-template-columns:1fr; grid-template-rows: 40vh 1fr; } aside{ order:2 } }
+</style>
+</head>
+<body>
+<aside>
+  <h1>TrackIt</h1>
+  <div class="muted" id="status">Connecting...</div>
+
+  <h3>Route filter</h3>
+  <select id="routeSel"><option value="">All routes</option></select>
+
+  <h3>ETA to a stop</h3>
+  <select id="vehSel"></select><br>
+  <select id="stopSel"></select><br>
+  <button onclick="getEta()">Get ETA</button> <div id="eta" class="muted"></div>
+
+  <h3>Nearby buses</h3>
+  <div class="muted">Click the map, then:</div>
+  <button onclick="findNearby()">Find within 2 km</button>
+  <div id="nearby"></div>
+
+  <h3>Trip replay</h3>
+  <button onclick="replay()">Show last 10 min of selected vehicle</button>
+
+  <h3>Geofence alerts</h3>
+  <div id="alerts" class="muted">Waiting for a bus to come within 500 m of a stop...</div>
+
+  <h3>Live vehicles (<span id="count">0</span>)</h3>
+  <div id="list"></div>
+</aside>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const map = L.map('map').setView([12.9716, 77.6], 12);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+
+const markers = {}, states = {}, routeLayers = {};
+let routes = [], clicked = null, clickMarker = null, replayLine = null, activeRoute = '';
+
+map.on('click', e => {
+  clicked = e.latlng;
+  if (clickMarker) map.removeLayer(clickMarker);
+  clickMarker = L.circleMarker(e.latlng, { radius: 7, color: '#d93025' }).addTo(map);
+});
+
+async function init() {
+  routes = await (await fetch('/api/routes')).json();
+  routes.forEach(r => {
+    $('routeSel').add(new Option(r.name, r.id));
+    const pts = r.stops.map(s => [s.lat, s.lng]);
+    L.polyline(pts, { color: '#999', weight: 3, dashArray: '6 6' }).addTo(map);
+    r.stops.forEach(s => L.circleMarker([s.lat, s.lng], { radius: 5, color: '#12a150', fillOpacity: 1 }).addTo(map).bindTooltip(s.name));
+  });
+  (await (await fetch('/api/vehicles/live')).json()).forEach(update);
+  connect();
+}
+
+function connect() {
+  const stomp = Stomp.over(new SockJS('/ws')); stomp.debug = null;
+  stomp.connect({}, () => {
+    $('status').textContent = 'Live (WebSocket connected)';
+    stomp.subscribe('/topic/vehicles', m => update(JSON.parse(m.body)));
+    routes.forEach(r => stomp.subscribe('/topic/alerts/' + r.id, m => addAlert(JSON.parse(m.body))));
+  }, () => { $('status').textContent = 'Disconnected, retrying...'; setTimeout(connect, 3000); });
+}
+
+function update(v) {
+  states[v.vehicleId] = v;
+  const visible = !activeRoute || String(v.routeId) === activeRoute;
+  if (!markers[v.vehicleId]) {
+    const busIcon = L.divIcon({
+      className: 'bus-marker-icon',
+      html: `<div class="bus-marker" role="img" aria-label="Bus ${v.vehicleId}">
+        <svg class="bus-marker__svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" aria-hidden="true">
+          <circle cx="22" cy="22" r="19" fill="#ffffff" stroke="#dbeafe" stroke-width="1.5"/>
+          <path d="M6.5 14.5a5 5 0 0 1 5-5h16.7a5 5 0 0 1 4.1 2.2l4.5 6.4v7.1a3.3 3.3 0 0 1-3.3 3.3H9.8a3.3 3.3 0 0 1-3.3-3.3z" fill="#4f46e5" stroke="#312e81" stroke-width="1.2"/>
+          <path d="M10 12.1h5.5v7H10zM17.2 12.1h5.5v7h-5.5zM24.4 12.1h4.2v7h-4.2z" fill="#c8f2ff" stroke="#ffffff" stroke-width=".5"/>
+          <path d="M30.5 12h1.2c.8 0 1.5.4 2 1.1l3.1 4.6h-6.3z" fill="#a5e8ff" stroke="#ffffff" stroke-width=".5"/>
+          <path d="M17 21h5.1v6H17z" fill="#e0e7ff" stroke="#ffffff" stroke-width=".6"/>
+          <path d="M8.6 21.5h6.5M24.5 21.5h4.1" stroke="#a5b4fc" stroke-width="1.1" stroke-linecap="round"/>
+          <rect x="35.5" y="21" width="1.8" height="3.6" rx=".7" fill="#fde68a"/>
+          <rect x="5.1" y="22" width="2.2" height="4.2" rx=".8" fill="#1e293b"/>
+          <g class="bus-marker__wheel"><circle cx="13.2" cy="28.2" r="3.3" fill="#1f2937" stroke="#ffffff" stroke-width=".9"/><circle cx="13.2" cy="28.2" r="1.1" fill="#cbd5e1"/><path d="M13.2 25.9v4.6M10.9 28.2h4.6" stroke="#cbd5e1" stroke-width=".55" stroke-linecap="round"/></g>
+          <g class="bus-marker__wheel"><circle cx="30.8" cy="28.2" r="3.3" fill="#1f2937" stroke="#ffffff" stroke-width=".9"/><circle cx="30.8" cy="28.2" r="1.1" fill="#cbd5e1"/><path d="M30.8 25.9v4.6M28.5 28.2h4.6" stroke="#cbd5e1" stroke-width=".55" stroke-linecap="round"/></g>
+          <path d="M17.6 30.3h8.8" stroke="#312e81" stroke-width="1.4" stroke-linecap="round"/>
+        </svg>
+      </div>`,
+      iconSize: [44, 44],
+      iconAnchor: [22, 22]
+    });
+    markers[v.vehicleId] = L.marker([v.lat, v.lng], { icon: busIcon })
+      .bindTooltip(v.vehicleId, { direction: 'top', offset: [0, -14] });
+    $('vehSel').add(new Option(v.vehicleId, v.vehicleId));
+  }
+  const m = markers[v.vehicleId];
+  m.setLatLng([v.lat, v.lng]);                       // marker jumps to the newest position
+  visible ? m.addTo(map) : map.removeLayer(m);
+  renderList();
+}
+
+function renderList() {
+  const ids = Object.keys(states).filter(id => !activeRoute || String(states[id].routeId) === activeRoute).sort();
+  $('count').textContent = ids.length;
+  $('list').innerHTML = ids.map(id => `<div class="veh" onclick="focusVeh('${id}')">${id} &middot; ${states[id].speedKmph} km/h</div>`).join('');
+}
+function focusVeh(id) { $('vehSel').value = id; map.panTo([states[id].lat, states[id].lng]); loadStops(); }
+
+$('routeSel').onchange = e => { activeRoute = e.target.value; Object.values(states).forEach(update); loadStops(); };
+$('vehSel').onchange = loadStops;
+function loadStops() {
+  const v = states[$('vehSel').value]; if (!v) return;
+  const r = routes.find(x => x.id === v.routeId);
+  $('stopSel').innerHTML = ''; r.stops.forEach(s => $('stopSel').add(new Option(s.name, s.id)));
+}
+
+async function getEta() {
+  const res = await fetch(`/api/vehicles/${$('vehSel').value}/eta?stopId=${$('stopSel').value}`);
+  const d = await res.json();
+  $('eta').textContent = res.ok ? `${d.vehicleId} -> ${d.stopName}: ~${d.etaMinutes} min (${d.distanceKm} km)` : d.error;
+}
+
+async function findNearby() {
+  if (!clicked) { $('nearby').textContent = 'Click the map first.'; return; }
+  const list = await (await fetch(`/api/vehicles/nearby?lat=${clicked.lat}&lng=${clicked.lng}&radiusKm=2`)).json();
+  $('nearby').innerHTML = list.length ? list.map(n => `<div class="veh" onclick="focusVeh('${n.vehicle.vehicleId}')">${n.vehicle.vehicleId} &middot; ${n.distanceKm} km</div>`).join('')
+                                      : '<div class="muted">No vehicles within 2 km.</div>';
+}
+
+async function replay() {
+  const id = $('vehSel').value; if (!id) return;
+  const pts = await (await fetch(`/api/vehicles/${id}/history?minutes=10`)).json();
+  if (replayLine) map.removeLayer(replayLine);
+  replayLine = L.polyline(pts.map(p => [p.lat, p.lng]), { color: '#d93025', weight: 4 }).addTo(map);
+  if (pts.length) map.fitBounds(replayLine.getBounds());
+}
+
+function addAlert(a) {
+  const el = document.createElement('div'); el.className = 'alert';
+  el.textContent = `${a.vehicleId} is ${a.distanceMeters} m from ${a.stopName} (ETA ~${a.etaMinutes} min)`;
+  if ($('alerts').classList.contains('muted')) { $('alerts').classList.remove('muted'); $('alerts').textContent = ''; }
+  $('alerts').prepend(el);
+  while ($('alerts').children.length > 6) $('alerts').lastChild.remove();
+}
+init();
+</script>
+</body>
+</html>
